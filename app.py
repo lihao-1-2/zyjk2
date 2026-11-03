@@ -32,6 +32,19 @@ if os.name != 'nt':  # Only on Unix-like systems (Docker usually runs Linux)
 
 app = Flask(__name__)
 
+def _env(name, default):
+    """patched-by-zyjk: env 为空字符串时回退默认值。
+
+    GitHub Actions 定时触发时，未填的 workflow_dispatch input 会渲染成空串，
+    直接 int("") / float("") 会在 import 阶段就崩掉整轮任务。
+    """
+    _v = os.environ.get(name)
+    if _v is None:
+        return default
+    _v = _v.strip()
+    return _v if _v else default
+
+
 # Constants
 API_URL = "https://iptvs.pes.im"
 CACHE_FILE = "iptv_sources.m3u8"
@@ -42,10 +55,75 @@ HSMD_ADDRESS_LIST_FILE = "hsmd_address_list.txt"
 ZHGXTV_INTERFACE = "/ZHGXTV/Public/json/live_interface.txt"
 TXIPTV_TEST_URI = "/tsfile/live/0001_1.m3u8"
 HSMDTV_TEST_URI = "/newlive/live/hls/1/live.m3u8"
-MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "40"))  # patched-by-zyjk
-MIN_SPEED = float(os.environ.get("MIN_SPEED", "0.05"))  # patched-by-zyjk
-KEEP_UNKNOWN = os.environ.get("KEEP_UNKNOWN", "1") == "1"  # patched-by-zyjk
-TOP_N = int(os.environ.get("TOP_N", "15"))  # patched-by-zyjk
+MAX_WORKERS = int(_env("MAX_WORKERS", "40"))  # patched-by-zyjk
+MIN_SPEED = float(_env("MIN_SPEED", "0.05"))  # patched-by-zyjk
+KEEP_UNKNOWN = _env("KEEP_UNKNOWN", "1") == "1"  # patched-by-zyjk
+# 全局 host 上限。实测 2318 个候选里只有 1%~2% 还能连上，
+# 真正的瓶颈是存活数而不是这个上限，所以开到 60，把活的全用上。
+TOP_N = int(_env("TOP_N", "60"))  # patched-by-zyjk
+# 取频道列表的超时。原版写死 2 秒（txiptv/jsmpeg），跨省链路稍抖就判死
+LIST_TIMEOUT = float(_env("LIST_TIMEOUT", "6"))  # patched-by-zyjk
+LIST_RETRIES = int(_env("LIST_RETRIES", "1"))  # patched-by-zyjk
+# 额外候选名单：逗号分隔的 raw 地址（CSV 需含 host 列，txt 每行一个 host[:port]）
+HOST_LIST_URLS = (os.environ.get("HOST_LIST_URLS") or "").strip()  # patched-by-zyjk
+# 每个节目（同名频道）最多保留几条源，尽量来自不同 host；0 = 不限
+PER_CHANNEL = int(_env("PER_CHANNEL", "3"))  # patched-by-zyjk
+# m3u 标题是否追加速度。播放器里能直接看到"源1 2.35MB/s"
+SHOW_SPEED = _env("SHOW_SPEED", "1") != "0"  # patched-by-zyjk
+# 容器内自动更新时间，24 小时制、逗号分隔（默认早 7 点、晚 18 点）
+UPDATE_TIMES = _env("UPDATE_TIMES", "07:00,18:00")  # patched-by-zyjk
+
+# ---------------------------------------------------------------------------
+# patched-by-zyjk: 清晰度过滤
+#   HD_ONLY=0  全部保留（原上游行为）
+#   HD_ONLY=1  默认：丢掉标注为标清的频道，未标注的保留
+#   HD_ONLY=2  只要标注了高清/超清/4K 的频道，未标注的一律不要
+# ---------------------------------------------------------------------------
+HD_ONLY = _env("HD_ONLY", "1")
+
+# 标清特征：中文标注 / SD 词元（HDSD、CCTV5SD 这种不带分隔的也认）
+_SD_PAT = re.compile(
+    r"标清|標清|标清画质|标准清晰|标准画质|普清|低清|流畅|平滑|省流|"
+    r"(?<![A-Za-z])SD(?![A-Za-z])|SDTV|480[PI]|360[PI]",
+    re.I,
+)
+# 高清特征
+_HD_PAT = re.compile(
+    r"高清|超清|超高清|蓝光|原画|4K|8K|UHD|FHD|HD|1080|2160|"
+    r"H\.?26[45]|HEVC|50帧|60帧",
+    re.I,
+)
+
+HD_STATS = {"kept": 0, "sd_dropped": 0, "unlabeled_dropped": 0, "sd_sample": []}
+
+
+def is_sd_channel(name):
+    name = (name or "").strip()
+    return bool(name) and bool(_SD_PAT.search(name))
+
+
+def is_hd_channel(name):
+    """明确标注了高清的才算 True（"HDSD" 这类先判为标清）。"""
+    name = (name or "").strip()
+    return bool(name) and bool(_HD_PAT.search(name)) and not is_sd_channel(name)
+
+
+def keep_channel(name):
+    """按 HD_ONLY 判断某条频道是否保留，顺带累计统计。"""
+    if HD_ONLY == "0":
+        HD_STATS["kept"] += 1
+        return True
+    if is_sd_channel(name):
+        HD_STATS["sd_dropped"] += 1
+        if len(HD_STATS["sd_sample"]) < 8:
+            HD_STATS["sd_sample"].append(name.strip())
+        return False
+    if HD_ONLY == "2" and not is_hd_channel(name):
+        HD_STATS["unlabeled_dropped"] += 1
+        return False
+    HD_STATS["kept"] += 1
+    return True
+
 
 global_m3u8_content = ""
 global_txt_content = ""
@@ -107,7 +185,62 @@ def fetch_api_data():
         except Exception as _e:
             print("[patch] 读取 %s 失败: %s" % (_fn, _e))
     print("[patch] 本地候选 host 共 %d 个" % len(out))
+
+    # patched-by-zyjk: 合并外部候选名单（HOST_LIST_URLS，逗号分隔）
+    # 三份 CSV 是静态快照，酒店盒子的 IP 换得很勤，实测存活率只剩 1%~2%。
+    # 想让结果真的变多，唯一有效的办法就是喂新名单，而不是调超时参数。
+    _ext_added = 0
+    for _url in [u.strip() for u in HOST_LIST_URLS.split(",") if u.strip()]:
+        _mt = "jsmpeg"
+        for _m in ("txiptv", "zhgxtv", "jsmpeg"):
+            if _m in _url.lower():
+                _mt = _m
+                break
+        try:
+            _resp = requests.get(_url, timeout=20)
+            _resp.raise_for_status()
+            _n = 0
+            for _line in _resp.text.splitlines():
+                _line = _line.strip()
+                if not _line or _line.startswith("#"):
+                    continue
+                if _line.lower().startswith("host"):
+                    continue  # 表头
+                _host = re.split(r"[,\t;]", _line)[0].strip().strip('"')
+                if not re.match(r"^[A-Za-z0-9.\-]+(:\d+)?$", _host):
+                    continue
+                _key = (_host, _mt)
+                if _key in seen:
+                    continue
+                seen.add(_key)
+                out.append({"host": _host, "matchType": _mt,
+                            "source": "url:" + _url.rsplit("/", 1)[-1]})
+                _n += 1
+            _ext_added += _n
+            print("[patch] 外部名单 %s → 新增 %d 个（按 %s 测）" % (_url, _n, _mt))
+        except Exception as _e:
+            print("[patch] 下载外部名单失败 %s: %s" % (_url, _e))
+    if HOST_LIST_URLS:
+        print("[patch] 外部名单合计新增 %d 个 host" % _ext_added)
+
+    print("[patch] 候选 host 合计 %d 个" % len(out))
     return {"results": out}
+
+def _get_list(url):
+    """patched-by-zyjk: 取频道列表专用的带重试 GET。
+
+    原版写死 timeout=2，且只有一次机会：跨境/跨省链路上丢一个包，
+    这个 host 就被判成"死源"再也不会被考虑。这里把超时放到 LIST_TIMEOUT（默认 6s），
+    并允许 LIST_RETRIES 次重试——只对"连不上"重试，4xx/5xx 不重试。
+    """
+    last = None
+    for _ in range(max(1, LIST_RETRIES + 1)):
+        try:
+            return requests.get(url, timeout=LIST_TIMEOUT)
+        except Exception as _e:  # 连接超时 / 拒绝 / DNS
+            last = _e
+    raise last
+
 
 def get_download_speed(url):
     """
@@ -192,8 +325,8 @@ def test_host_speed(item):
             # Updated logic to use JSON API like iptv.py
             json_url = f"http://{host}/iptv/live/1000.json?key=txiptv"
             try:
-                # Use short timeout for JSON fetch as per iptv.py logic (0.5s there, maybe generic 2s here)
-                response = requests.get(json_url, timeout=2)
+                # patched-by-zyjk: 原版 timeout=2 太紧，链接抖动就把活源判死
+                response = _get_list(json_url)
                 if response.status_code == 200:
                     json_data = response.json()
                     valid_channel_url = None
@@ -246,7 +379,7 @@ def test_host_speed(item):
             # jsmpeg logic from all-z-j-new.py
             json_url = f"http://{host}/streamer/list"
             try:
-                response = requests.get(json_url, timeout=2)
+                response = _get_list(json_url)
                 if response.status_code == 200:
                     json_data = response.json()
                     valid_channel_url = None
@@ -278,7 +411,7 @@ def test_host_speed(item):
         elif match_type == 'zhgxtv':
             # Referencing ZHGXTV.py: Fetch live_interface.txt first
             interface_url = f"http://{host}{ZHGXTV_INTERFACE}"
-            target_response = requests.get(interface_url, timeout=5)
+            target_response = _get_list(interface_url)
             if target_response.status_code == 200:
                 content = target_response.content.decode('utf-8', errors='ignore')
                 lines = content.split('\n')
@@ -331,8 +464,22 @@ def test_host_speed(item):
     except Exception as e:
         # print(f"Speed test failed for {host}: {e}")
         speed = -1
-        
-    return speed, channels
+
+    # patched-by-zyjk: 把失败分个类。光看 -1 分不清是两种完全不同的情况：
+    #   no_list  连频道列表都取不到（2s 超时 / 404 / JSON 解析失败）→ 这个 host 没用
+    #   ts_fail  列表能取到，但首个 TS 分片 8s 内没拉下来       → 海外跑必然一片这个
+    if speed > 0:
+        reason = "ok"
+    elif channels or match_type == "hsmdtv":
+        reason = "ts_fail"
+    else:
+        reason = "no_list"
+
+    # patched-by-zyjk: 只要高清——标清频道在这一步就剔除，顺带少吃内存
+    if HD_ONLY != "0":
+        channels = [c for c in channels if keep_channel(c.get("name"))]
+
+    return speed, channels, reason
 
 def clean_channel_name(name):
     """Clean and normalize channel name."""
@@ -406,6 +553,9 @@ def process_hsmdtv_channels(host, source_label, source_index):
                 name = re.sub(r'^\s*\d+\s+', '', part_before_url).strip()
                 # Clean name
                 name = name.replace("（默认频道）", "").strip()
+                # patched-by-zyjk: 只要高清，标清频道直接跳过（hsmdtv 的频道表来自本地 txt）
+                if HD_ONLY != "0" and not keep_channel(name):
+                    continue
                 name = clean_channel_name(name)
                 
                 # Standardization
@@ -494,6 +644,8 @@ def scheduled_task():
     check_for_updates()
     global global_m3u8_content, global_txt_content, last_run_time, is_running
     is_running = True
+    HD_STATS.update(kept=0, sd_dropped=0, unlabeled_dropped=0)  # patched-by-zyjk
+    HD_STATS["sd_sample"] = []
     print("Executing scheduled task...")
     last_run_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
     
@@ -518,14 +670,15 @@ def scheduled_task():
         for future in as_completed(future_to_item):
             item = future_to_item[future]
             try:
-                speed, channels = future.result()
+                speed, channels, reason = future.result()
                 if speed > 0 or KEEP_UNKNOWN:  # patched-by-zyjk
                     print(f"Host {item['host']} Speed: {speed:.2f} MB/s matchType: {item['matchType']} source: {item.get('source', 'N/A')}")
                     results_with_speed.append({
                         'host': item['host'],
                         'matchType': item['matchType'],
                         'speed': speed,
-                        'channels': channels
+                        'channels': channels,
+                        'reason': reason
                     })
             except Exception as e:
                 print(f"Error testing {item['host']}: {e}")
@@ -533,25 +686,61 @@ def scheduled_task():
     # Sort and pick top N
     
     # Filter by speed limit 2MB/s
-    valid_results = [r for r in results_with_speed if r["speed"] > MIN_SPEED or (KEEP_UNKNOWN and r["speed"] <= 0)]  # patched-by-zyjk
+    # patched-by-zyjk: 顺便把"一条高清频道都没有"的 host 排除在候选之外——
+    # 它们就算被选进 TOP_N 也生成不出任何条目，纯占名额
+    valid_results = [
+        r for r in results_with_speed
+        if (r["speed"] > MIN_SPEED or (KEEP_UNKNOWN and r["speed"] <= 0))
+        and not (HD_ONLY != "0" and r.get("matchType") != "hsmdtv" and not r.get("channels"))
+    ]
     
     # Sort by speed descending
     valid_results.sort(key=lambda x: x['speed'], reverse=True)
 
     # patched-by-zyjk: 落盘测速明细，供 CI 复制为 output/speed_report.txt
+    # 列：host / matchType / speed_mb_s / status / reason / channels
+    #   reason    no_list=连频道列表都取不到 → 这个 host 是死的，别再调参数
+    #             ts_fail=列表能读、首个 TS 分片拉不动 → 源大概率还能用，只是测不出速度
+    #             ok=测速成功
+    #   channels  清晰度过滤后还剩几条频道（0 说明这个 host 对产出没贡献）
+    _scanned = len(results_with_speed)
+    _dist = {}
     try:
+        _rows = []
+        for _r in sorted(results_with_speed, key=lambda x: x["speed"], reverse=True):
+            _rs = _r.get("reason") or "unknown"
+            _dist[_rs] = _dist.get(_rs, 0) + 1
+            if _r["speed"] > MIN_SPEED:
+                _st = "ok"
+            elif _r["speed"] > 0:
+                _st = "slow(低于阈值)"
+            else:
+                _st = "fail(%s)" % _rs
+            _rows.append("%s\t%s\t%.2f\t%s\t%s\t%d\n" % (
+                _r["host"], _r.get("matchType", ""), _r["speed"], _st,
+                _rs, len(_r.get("channels") or [])))
+
+        _alive = _dist.get("ok", 0) + _dist.get("ts_fail", 0)
         with open("speed_report.txt", "w", encoding="utf-8") as _sf:
-            _sf.write("host\tmatchType\tspeed_mb_s\tstatus\n")
-            for _r in sorted(results_with_speed, key=lambda x: x["speed"], reverse=True):
-                if _r["speed"] <= 0:
-                    _st = "fail(测速超时)"
-                elif _r["speed"] <= MIN_SPEED:
-                    _st = "slow(低于阈值)"
-                else:
-                    _st = "ok"
-                _sf.write("%s\t%s\t%.2f\t%s\n" % (
-                    _r["host"], _r.get("matchType", ""), _r["speed"], _st))
-        print("[patch] 测速明细已写入 speed_report.txt（%d 个 host）" % len(results_with_speed))
+            _sf.write("# 候选 %d 个｜连得上 %d 个（%.1f%%）｜能出源 %d 个\n"
+                      % (_scanned, _alive,
+                         (100.0 * _alive / _scanned) if _scanned else 0.0,
+                         len(valid_results)))
+            _sf.write("# 分布：%s\n" % "，".join(
+                "%s %d" % (k, v) for k, v in sorted(_dist.items(), key=lambda kv: -kv[1])))
+            _sf.write("# no_list=整台连不上，没救；"
+                      "ts_fail=频道列表能读但测不出速度，源大概率还能用\n")
+            _sf.write("host\tmatchType\tspeed_mb_s\tstatus\treason\tchannels\n")
+            _sf.writelines(_rows)
+        print("[patch] 测速明细已写入 speed_report.txt（%d 个 host）" % _scanned)
+        print("[patch] 结果分布：%s" % "，".join(
+            "%s %d 个" % (k, v) for k, v in sorted(_dist.items(), key=lambda kv: -kv[1])))
+        if _dist.get("no_list"):
+            print("[patch] no_list = %(t).0f 秒内连频道列表都取不到（超时/拒绝/404），"
+                  "这类 host 是死的，调大超时也救不回来" % {"t": LIST_TIMEOUT})
+        if _dist.get("ts_fail"):
+            print("[patch] ts_fail = 频道列表能读、首个 TS 分片拉不动，"
+                  "源大概率还能用，只是测不出速度")
     except Exception as _e:
         print("[patch] 写 speed_report.txt 失败: %s" % _e)
     
@@ -583,9 +772,16 @@ def scheduled_task():
     top_sources = final_sources
     
     print(f"Selected top {len(top_sources)} sources.")
+    # patched-by-zyjk: 清晰度过滤统计
+    print("[patch] 清晰度过滤 HD_ONLY=%s：保留 %d 条频道，丢弃标清 %d 条%s"
+          % (HD_ONLY, HD_STATS["kept"], HD_STATS["sd_dropped"],
+             ("，丢弃未标注高清 %d 条" % HD_STATS["unlabeled_dropped"])
+             if HD_ONLY == "2" else ""))
+    if HD_STATS["sd_sample"]:
+        print("[patch] 被丢弃的标清样例：%s" % "、".join(HD_STATS["sd_sample"]))
 
-    if len(top_sources) < int(os.environ.get("MIN_SOURCES", "1")):  # patched-by-zyjk
-        print(f"Not enough sources found ({len(top_sources)} < {os.environ.get('MIN_SOURCES', '1')}).")
+    if len(top_sources) < int(_env("MIN_SOURCES", "1")):  # patched-by-zyjk
+        print(f"Not enough sources found ({len(top_sources)} < {_env('MIN_SOURCES', '1')}).")
         
         # Load from file if empty in memory
         if not global_m3u8_content and os.path.exists(CACHE_FILE):
@@ -632,18 +828,22 @@ def scheduled_task():
         m3u8_label = f"源{idx+1}"
         print(f"Processing {console_label}: {source['host']} ({source['matchType']}) {source.get('source', 'N/A')}")
         
+        entries = []
         if source['matchType'] == 'txiptv':
             entries = process_txiptv_channels(source['channels'], m3u8_label, idx)
-            all_entries.extend(entries)
         elif source['matchType'] == 'hsmdtv':
             entries = process_hsmdtv_channels(source['host'], m3u8_label, idx)
-            all_entries.extend(entries)
         elif source['matchType'] == 'zhgxtv':
             entries = process_zhgxtv_channels(source['channels'], m3u8_label, idx)
-            all_entries.extend(entries)
         elif source['matchType'] == 'jsmpeg':
             entries = process_jsmpeg_channels(source['channels'], m3u8_label, idx)
-            all_entries.extend(entries)
+
+        # patched-by-zyjk: 把 host / 速度挂到每条 entry 上，
+        # 后面"每节目最多 N 源"要按 host 去重，m3u 标题也要用速度
+        for _e in entries:
+            _e['_host'] = source['host']
+            _e['_speed'] = source['speed']
+        all_entries.extend(entries)
 
     # Group by name
     # We want to keep the order of channel names as much as possible
@@ -661,12 +861,42 @@ def scheduled_task():
     except:
         pass
 
+    _seen_entry = set()
     for entry in all_entries:
         name = entry['name']
+        # patched-by-zyjk: 同名同地址只留一条，避免同一 host 重复刷屏
+        _k = (name, entry.get('url'))
+        if _k in _seen_entry:
+            continue
+        _seen_entry.add(_k)
         if name not in grouped_entries:
             grouped_entries[name] = []
         grouped_entries[name].append(entry)
 
+    # patched-by-zyjk: 每个节目最多留 PER_CHANNEL 条源，且尽量来自不同 host
+    # （同一台 host 上的同名频道只算一条，否则 3 个源全是一个盒子，一起挂）
+    _per_channel_stats = {"keep": 0, "drop": 0}
+    if PER_CHANNEL > 0:
+        for _name in list(grouped_entries.keys()):
+            _lst = grouped_entries[_name]
+            if not _lst:
+                continue
+            _lst.sort(key=lambda x: (x.get('index', 999), -(x.get('_speed') or 0)))
+            _picked, _hosts = [], set()
+            for _e in _lst:
+                _h = _e.get('_host') or _e.get('url')
+                if _h in _hosts:
+                    continue
+                _hosts.add(_h)
+                _picked.append(_e)
+                if len(_picked) >= PER_CHANNEL:
+                    break
+            _per_channel_stats["keep"] += len(_picked)
+            _per_channel_stats["drop"] += max(0, len(_lst) - len(_picked))
+            grouped_entries[_name] = _picked
+        print("[patch] 每节目最多 %d 条源：保留 %d 条，裁掉多余 %d 条"
+              % (PER_CHANNEL, _per_channel_stats["keep"], _per_channel_stats["drop"]))
+    
     # Sort the channel names
     
     # Pre-populate order from channel_list.txt if we want specific order for those
@@ -698,7 +928,14 @@ def scheduled_task():
         entries_list.sort(key=lambda x: x['index'])
         if entries_list:  # Only add header if sources exist (optional, m3u8 format usually implies listing)
             for entry in entries_list:
-                 m3u8_lines.append(entry['content'])
+                 if SHOW_SPEED:  # patched-by-zyjk: 标题追加 [源N 速度]
+                     _sp = entry.get('_speed') or 0
+                     _tag = ("%.2fMB/s" % _sp) if _sp > 0 else "未测速"
+                     _title = "%s [源%d %s]" % (name, entry.get('index', 0) + 1, _tag)
+                     m3u8_lines.append('#EXTINF:-1 group-title="IPTV",%s\n%s'
+                                       % (_title, entry['url']))
+                 else:
+                     m3u8_lines.append(entry['content'])
 
     global_m3u8_content = "\n".join(m3u8_lines)
     
@@ -784,8 +1021,27 @@ def force_retest():
 
 # Initial run in background on startup (or trigger manually)
 def start_scheduler():
-    scheduler = BackgroundScheduler()
-    scheduler.add_job(func=scheduled_task, trigger="interval", hours=12)
+    # patched-by-zyjk: 固定时刻更新（默认早 07:00 / 晚 18:00，北京时间），
+    # 不再用 interval=12h —— 那样更新时间会随启动时间漂移。
+    scheduler = BackgroundScheduler(timezone="Asia/Shanghai")
+    _jobs = []
+    for _t in UPDATE_TIMES.split(","):
+        try:
+            _h, _m = [int(x) for x in _t.strip().split(":")]
+            if 0 <= _h < 24 and 0 <= _m < 60:
+                _jobs.append((_h, _m))
+        except Exception:
+            print("[patch] 忽略无效的更新时间配置：%r" % _t)
+
+    if _jobs:
+        for _h, _m in _jobs:
+            scheduler.add_job(func=scheduled_task, trigger="cron", hour=_h, minute=_m)
+        print("[patch] 定时更新：%s（Asia/Shanghai）"
+              % "、".join("%02d:%02d" % j for j in _jobs))
+    else:
+        print("[patch] UPDATE_TIMES 无效，回退为每 12 小时一次")
+        scheduler.add_job(func=scheduled_task, trigger="interval", hours=12)
+
     scheduler.start()
     
     # Run immediately in a separate thread to not block startup
