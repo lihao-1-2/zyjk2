@@ -43,8 +43,9 @@ ZHGXTV_INTERFACE = "/ZHGXTV/Public/json/live_interface.txt"
 TXIPTV_TEST_URI = "/tsfile/live/0001_1.m3u8"
 HSMDTV_TEST_URI = "/newlive/live/hls/1/live.m3u8"
 MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "40"))  # patched-by-zyjk
-MIN_SPEED = float(os.environ.get("MIN_SPEED", "0.2"))  # patched-by-zyjk
-TOP_N = 5
+MIN_SPEED = float(os.environ.get("MIN_SPEED", "0.05"))  # patched-by-zyjk
+KEEP_UNKNOWN = os.environ.get("KEEP_UNKNOWN", "1") == "1"  # patched-by-zyjk
+TOP_N = int(os.environ.get("TOP_N", "15"))  # patched-by-zyjk
 
 global_m3u8_content = ""
 global_txt_content = ""
@@ -518,7 +519,7 @@ def scheduled_task():
             item = future_to_item[future]
             try:
                 speed, channels = future.result()
-                if speed > 0:
+                if speed > 0 or KEEP_UNKNOWN:  # patched-by-zyjk
                     print(f"Host {item['host']} Speed: {speed:.2f} MB/s matchType: {item['matchType']} source: {item.get('source', 'N/A')}")
                     results_with_speed.append({
                         'host': item['host'],
@@ -532,10 +533,27 @@ def scheduled_task():
     # Sort and pick top N
     
     # Filter by speed limit 2MB/s
-    valid_results = [r for r in results_with_speed if r['speed'] > MIN_SPEED]
+    valid_results = [r for r in results_with_speed if r["speed"] > MIN_SPEED or (KEEP_UNKNOWN and r["speed"] <= 0)]  # patched-by-zyjk
     
     # Sort by speed descending
     valid_results.sort(key=lambda x: x['speed'], reverse=True)
+
+    # patched-by-zyjk: 落盘测速明细，供 CI 复制为 output/speed_report.txt
+    try:
+        with open("speed_report.txt", "w", encoding="utf-8") as _sf:
+            _sf.write("host\tmatchType\tspeed_mb_s\tstatus\n")
+            for _r in sorted(results_with_speed, key=lambda x: x["speed"], reverse=True):
+                if _r["speed"] <= 0:
+                    _st = "fail(测速超时)"
+                elif _r["speed"] <= MIN_SPEED:
+                    _st = "slow(低于阈值)"
+                else:
+                    _st = "ok"
+                _sf.write("%s\t%s\t%.2f\t%s\n" % (
+                    _r["host"], _r.get("matchType", ""), _r["speed"], _st))
+        print("[patch] 测速明细已写入 speed_report.txt（%d 个 host）" % len(results_with_speed))
+    except Exception as _e:
+        print("[patch] 写 speed_report.txt 失败: %s" % _e)
     
     final_sources = []
     selected_hosts = set()
@@ -609,7 +627,7 @@ def scheduled_task():
     all_entries = []
     
     for idx, source in enumerate(top_sources):
-        speed_str = f"{source['speed']:.2f}MB/s"
+        speed_str = (f"{source['speed']:.2f}MB/s" if source["speed"] > 0 else "未测速")  # patched-by-zyjk
         console_label = f"源{idx+1} {speed_str}"
         m3u8_label = f"源{idx+1}"
         print(f"Processing {console_label}: {source['host']} ({source['matchType']}) {source.get('source', 'N/A')}")
