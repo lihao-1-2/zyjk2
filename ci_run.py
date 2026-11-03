@@ -143,18 +143,34 @@ def publish():
     with open(os.path.join(OUT_DIR, "iptv.txt"), "w", encoding="utf-8", newline="\n") as f:
         f.write(txt)
 
+    # app.py 会把每个 host 的测速结果写到运行目录，搬过来方便核对
+    hosts = {}
+    src_report = os.path.join(WORK_DIR, "speed_report.txt")
+    if os.path.exists(src_report):
+        shutil.copyfile(src_report, os.path.join(OUT_DIR, "speed_report.txt"))
+        for line in open(src_report, encoding="utf-8").read().splitlines()[1:]:
+            col = line.split("\t")
+            if len(col) >= 4:
+                hosts[col[3]] = hosts.get(col[3], 0) + 1
+        log("测速明细：%s" % ", ".join("%s %d 个" % (k, v) for k, v in sorted(hosts.items())))
+    else:
+        log("警告：没有 speed_report.txt（app.py 未产出）")
+
     status = {
         "updated_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "updated_at_local": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
         "channels": n,
         "modes": parse_modes(),
         "max_workers": int(os.environ.get("MAX_WORKERS", "40")),
-        "min_speed_mb": float(os.environ.get("MIN_SPEED", "0.2")),
+        "min_speed_mb": float(os.environ.get("MIN_SPEED", "0.05")),
+        "keep_unknown": os.environ.get("KEEP_UNKNOWN", "1") == "1",
+        "top_n": int(os.environ.get("TOP_N", "15")),
+        "hosts_by_status": hosts,
         "runner": os.environ.get("GITHUB_RUN_ID", ""),
     }
     with open(os.path.join(OUT_DIR, "status.json"), "w", encoding="utf-8", newline="\n") as f:
         json.dump(status, f, ensure_ascii=False, indent=2)
-    log("已写入 output/iptv.m3u、output/iptv.txt、output/status.json")
+    log("已写入 output/iptv.m3u、output/iptv.txt、output/status.json、output/speed_report.txt")
     return True
 
 
