@@ -1,0 +1,13 @@
+{
+  "updated_at_utc": "2026-11-03T03:44:24Z",
+  "updated_at_local": "2026-11-03 11:44:24",
+  "channels": 67,
+  "modes": [
+    "jsmpeg",
+    "txiptv",
+    "zhgxtv"
+  ],
+  "max_workers": 40,
+  "min_speed_mb": 0.2,
+  "runner": "41573724570"
+}
