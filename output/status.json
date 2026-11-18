@@ -1,7 +1,7 @@
 {
-  "updated_at_utc": "2026-11-03T08:05:06Z",
-  "updated_at_local": "2026-11-03 16:05:06",
-  "channels": 1297,
+  "updated_at_utc": "2026-11-18T07:37:50Z",
+  "updated_at_local": "2026-11-18 15:37:50",
+  "channels": 1173,
   "modes": [
     "jsmpeg",
     "txiptv",
@@ -13,10 +13,10 @@
   "top_n": 15,
   "hosts_by_status": {
     "status": 1,
-    "ok": 1,
+    "ok": 5,
     "slow(低于阈值)": 1,
-    "fail(no_list)": 2294,
-    "fail(ts_fail)": 13
+    "fail(no_list)": 2295,
+    "fail(ts_fail)": 8
   },
-  "runner": "41599536705"
+  "runner": "44259117785"
 }
